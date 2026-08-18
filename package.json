@@ -1,8 +1,12 @@
 {
   "name": "opencode-matt-pocock-skills",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenCode plugin that installs and maintains Matt Pocock's skills collection",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mumme-IT/opencode-matt-pocock-skills.git"
+  },
   "type": "module",
   "packageManager": "pnpm@11.18.0",
   "engines": {
