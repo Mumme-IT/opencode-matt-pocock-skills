@@ -46,6 +46,7 @@ export function defaultStateDir(env: NodeJS.ProcessEnv = process.env): string {
 export function resolveOptions(
   value: unknown,
   env: NodeJS.ProcessEnv = process.env,
+  directory: string = process.cwd(),
 ): ResolvedOptions {
   if (
     value !== undefined &&
@@ -66,7 +67,7 @@ export function resolveOptions(
   if (typeof stateDir !== "string" || stateDir.trim() === "") {
     throw new TypeError("stateDir must be a non-empty string");
   }
-  stateDir = isAbsolute(stateDir) ? resolve(stateDir) : resolve(stateDir);
+  stateDir = resolve(directory, stateDir);
 
   return {
     stateDir,

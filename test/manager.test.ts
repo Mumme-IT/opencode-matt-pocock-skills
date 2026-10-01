@@ -118,7 +118,7 @@ async function storedState(root: string): Promise<Record<string, unknown>> {
 }
 
 describe("SkillsManager", () => {
-  it("injects valid absolute path once while preserving skills config", async () => {
+  it("returns validated absolute release path without network work", async () => {
     const root = await temporaryRoot();
     const path = await writeRelease(
       root,
@@ -133,14 +133,9 @@ describe("SkillsManager", () => {
       "blocking",
       86_400_000,
     );
-    const config = {
-      skills: { paths: [path], urls: ["https://example.test/skills"] },
-    };
-
-    await subject.configure(config);
-
-    expect(config.skills.paths).toEqual([path]);
-    expect(config.skills.urls).toEqual(["https://example.test/skills"]);
+    const active = await subject.load();
+    expect(active?.path).toBe(path);
+    expect(active?.skills[0]?.id).toBe("nested");
     expect(fetch).not.toHaveBeenCalled();
     expect(install).not.toHaveBeenCalled();
   });
@@ -150,15 +145,17 @@ describe("SkillsManager", () => {
     const fetch = vi.fn(async () => commitResponse(SHA_1));
     const install = vi.fn(successfulInstall);
     const { manager: subject } = manager(root, { fetch, install });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
+    const active = await subject.load();
 
     expect(fetch).toHaveBeenCalledOnce();
     expect(install).toHaveBeenCalledOnce();
-    expect(install).toHaveBeenCalledWith(expect.any(String), SHA_1, 1_000);
-    expect(config.skills?.paths).toHaveLength(1);
-    expect(config.skills?.paths?.[0]).toMatch(/releases\/.*\.agents\/skills$/);
+    expect(install).toHaveBeenCalledWith(
+      expect.any(String),
+      SHA_1,
+      1_000,
+      expect.any(AbortSignal),
+    );
+    expect(active?.path).toMatch(/releases\/.*\.agents\/skills$/);
     expect((await storedState(root)).upstreamCommitSha).toBe(SHA_1);
   });
 
@@ -170,11 +167,7 @@ describe("SkillsManager", () => {
       install: vi.fn(async () => undefined),
       warn,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toBeUndefined();
+    expect(await subject.load()).toBeUndefined();
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining("initial install failed"),
     );
@@ -193,7 +186,7 @@ describe("SkillsManager", () => {
       60_001,
     );
 
-    await subject.configure({});
+    await subject.load();
 
     expect(fetch).not.toHaveBeenCalled();
     expect(install).not.toHaveBeenCalled();
@@ -205,11 +198,7 @@ describe("SkillsManager", () => {
     const fetch = vi.fn();
     const install = vi.fn();
     const { manager: subject } = manager(root, { fetch, install }, "off");
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toEqual([path]);
+    expect((await subject.load())?.path).toBe(path);
     expect(fetch).not.toHaveBeenCalled();
     expect(install).not.toHaveBeenCalled();
   });
@@ -223,11 +212,7 @@ describe("SkillsManager", () => {
     const install = vi.fn();
     const fetch = vi.fn(async () => response);
     const { manager: subject } = manager(root, { fetch, install });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toEqual([oldPath]);
+    expect((await subject.load())?.path).toBe(oldPath);
     expect(install).not.toHaveBeenCalled();
     expect((await storedState(root)).checkedAt).toBe(
       "2026-08-17T00:00:00.000Z",
@@ -248,13 +233,9 @@ describe("SkillsManager", () => {
       fetch: vi.fn(async () => commitResponse(SHA_2)),
       install,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
+    const active = await subject.load();
     expect(install).toHaveBeenCalledOnce();
-    expect(config.skills?.paths).toHaveLength(1);
-    expect(config.skills?.paths?.[0]).not.toBe(oldPath);
+    expect(active?.path).not.toBe(oldPath);
     expect((await storedState(root)).upstreamCommitSha).toBe(SHA_2);
     await expect(
       readFile(join(oldPath, "example", "nested", "SKILL.md"), "utf8"),
@@ -271,17 +252,15 @@ describe("SkillsManager", () => {
       { fetch: vi.fn(() => response.promise), install },
       "background",
     );
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-    expect(config.skills?.paths).toEqual([oldPath]);
+    const active = await subject.load();
+    expect(active?.path).toBe(oldPath);
     expect(install).not.toHaveBeenCalled();
 
+    const refresh = subject.refresh();
     response.resolve(commitResponse(SHA_2));
-    await vi.waitFor(async () =>
-      expect((await storedState(root)).upstreamCommitSha).toBe(SHA_2),
-    );
-    expect(config.skills?.paths).toEqual([oldPath]);
+    expect((await refresh)?.path).not.toBe(oldPath);
+    expect((await storedState(root)).upstreamCommitSha).toBe(SHA_2);
+    expect(active?.path).toBe(oldPath);
   });
 
   it("preserves old release and state after update failure", async () => {
@@ -295,11 +274,7 @@ describe("SkillsManager", () => {
       }),
       warn,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toEqual([oldPath]);
+    expect((await subject.load())?.path).toBe(oldPath);
     expect((await storedState(root)).upstreamCommitSha).toBe(SHA_1);
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining("keeping previous release"),
@@ -312,11 +287,7 @@ describe("SkillsManager", () => {
     await mkdir(join(root, "update.lock"), { recursive: true });
     const fetch = vi.fn();
     const { manager: subject } = manager(root, { fetch });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toEqual([path]);
+    expect((await subject.load())?.path).toBe(path);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -330,11 +301,7 @@ describe("SkillsManager", () => {
       fetch: vi.fn(async () => commitResponse(SHA_1)),
       install: successfulInstall,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toHaveLength(1);
+    expect((await subject.load())?.skills).toHaveLength(1);
     await expect(stat(join(root, "update.lock"))).rejects.toThrow();
   });
 
@@ -348,18 +315,18 @@ describe("SkillsManager", () => {
     const fetch = vi.fn(async () => commitResponse(SHA_1));
     const first = manager(root, { install, fetch }).manager;
     const second = manager(root, { install, fetch }).manager;
-    const firstConfig: { skills?: { paths?: string[] } } = {};
-    const secondConfig: { skills?: { paths?: string[] } } = {};
-
-    const firstRun = first.configure(firstConfig);
+    const firstRun = first.load();
     await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
-    const secondRun = second.configure(secondConfig);
+    const secondRun = second.load();
     gate.resolve();
-    await Promise.all([firstRun, secondRun]);
+    const [firstActive, secondActive] = await Promise.all([
+      firstRun,
+      secondRun,
+    ]);
 
     expect(install).toHaveBeenCalledOnce();
     expect(fetch).toHaveBeenCalledOnce();
-    expect(secondConfig.skills?.paths).toEqual(firstConfig.skills?.paths);
+    expect(secondActive?.path).toBe(firstActive?.path);
   });
 
   it("ignores invalid state and never injects its release path", async () => {
@@ -375,11 +342,7 @@ describe("SkillsManager", () => {
       }),
       warn,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toBeUndefined();
+    expect(await subject.load()).toBeUndefined();
   });
 
   it("rejects malformed upstream commit SHA before install", async () => {
@@ -391,12 +354,8 @@ describe("SkillsManager", () => {
       install,
       warn,
     });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
+    expect(await subject.load()).toBeUndefined();
     expect(install).not.toHaveBeenCalled();
-    expect(config.skills?.paths).toBeUndefined();
     expect(warn).toHaveBeenCalledWith(
       expect.stringContaining("no valid 40-character lowercase commit SHA"),
     );
@@ -415,11 +374,7 @@ describe("SkillsManager", () => {
         }),
     );
     const { manager: subject } = manager(root, { fetch, warn });
-    const config: { skills?: { paths?: string[] } } = {};
-
-    await subject.configure(config);
-
-    expect(config.skills?.paths).toEqual([path]);
+    expect((await subject.load())?.path).toBe(path);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("fetch aborted"));
   });
 });

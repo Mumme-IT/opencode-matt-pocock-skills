@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export const SKILLS_CLI_VERSION = "1.5.22";
 export const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -38,9 +39,10 @@ export interface Runtime {
     cwd: string,
     upstreamCommitSha: string,
     timeoutMs: number,
+    signal?: AbortSignal,
   ) => Promise<void>;
   now: () => number;
-  sleep: (milliseconds: number) => Promise<void>;
+  sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
   randomId: () => string;
   warn: (message: string) => void;
 }
@@ -127,7 +129,8 @@ export function createInstaller(
     ...overrides,
   };
 
-  return (cwd, upstreamCommitSha, timeoutMs) => {
+  return (cwd, upstreamCommitSha, timeoutMs, signal) => {
+    signal?.throwIfAborted();
     const executable = dependencies.platform === "win32" ? "npx.cmd" : "npx";
     const environment = buildChildEnvironment(dependencies.environment);
     const args = buildSkillsArguments(upstreamCommitSha);
@@ -143,6 +146,7 @@ export function createInstaller(
       });
       let settled = false;
       let timedOut = false;
+      let aborted = false;
       let forceKillTimer: NodeJS.Timeout | undefined;
 
       const finish = (error?: Error): void => {
@@ -150,6 +154,7 @@ export function createInstaller(
         settled = true;
         clearTimeout(timeoutTimer);
         if (forceKillTimer) clearTimeout(forceKillTimer);
+        signal?.removeEventListener("abort", abort);
         if (error) reject(error);
         else resolve();
       };
@@ -157,8 +162,7 @@ export function createInstaller(
       const timeoutError = (): Error =>
         new Error(`skills CLI timed out after ${timeoutMs}ms`);
 
-      const timeoutTimer = setTimeout(() => {
-        timedOut = true;
+      const terminate = (): void => {
         if (dependencies.platform === "win32") {
           terminateWindowsTree(child, dependencies, environment);
         } else if (child.pid !== undefined) {
@@ -177,17 +181,29 @@ export function createInstaller(
               child.kill("SIGKILL");
             }
           }
-          finish(timeoutError());
+          finish(aborted ? new Error("skills CLI aborted") : timeoutError());
         }, 1_000);
         forceKillTimer.unref();
+      };
+      const abort = (): void => {
+        if (settled || aborted || timedOut) return;
+        aborted = true;
+        terminate();
+      };
+      const timeoutTimer = setTimeout(() => {
+        if (settled || aborted) return;
+        timedOut = true;
+        terminate();
       }, timeoutMs);
       timeoutTimer.unref();
 
       child.once("error", (error) => {
-        if (!timedOut) finish(error);
+        if (!timedOut && !aborted) finish(error);
       });
       child.once("close", (code, signal) => {
-        if (timedOut) return;
+        // The leader can exit before its descendants. Keep the escalation timer
+        // alive on both timeout and cancellation to terminate the whole group.
+        if (timedOut || aborted) return;
         if (code !== 0) {
           finish(
             new Error(
@@ -198,6 +214,8 @@ export function createInstaller(
           finish();
         }
       });
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
     });
   };
 }
@@ -207,8 +225,7 @@ export function createRuntime(overrides: Partial<Runtime> = {}): Runtime {
     fetch: globalThis.fetch,
     install: createInstaller(),
     now: Date.now,
-    sleep: (milliseconds) =>
-      new Promise((resolve) => setTimeout(resolve, milliseconds)),
+    sleep: (milliseconds, signal) => sleep(milliseconds, undefined, { signal }),
     randomId: randomUUID,
     warn: (message) => console.warn(`[opencode-matt-pocock-skills] ${message}`),
     ...overrides,

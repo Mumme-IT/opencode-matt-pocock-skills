@@ -147,4 +147,40 @@ describe("skills CLI runtime", () => {
       }),
     );
   });
+
+  it("terminates an installer process group on cancellation", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild(91);
+    const killProcessGroup = vi.fn();
+    const install = createInstaller({
+      spawnProcess: vi.fn(() => child) as unknown as typeof spawn,
+      platform: "linux",
+      environment: { PATH: "/bin" },
+      killProcessGroup,
+    });
+    const controller = new AbortController();
+    const result = install("/stage", COMMIT, 10_000, controller.signal);
+    const assertion = expect(result).rejects.toThrow("aborted");
+    controller.abort();
+    expect(killProcessGroup).toHaveBeenCalledWith(91, "SIGTERM");
+    child.emit("close", null, "SIGTERM");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await assertion;
+    expect(killProcessGroup).toHaveBeenCalledWith(91, "SIGKILL");
+  });
+
+  it("does not spawn when already cancelled", () => {
+    const spawnProcess = vi.fn() as unknown as typeof spawn;
+    const controller = new AbortController();
+    controller.abort();
+    expect(() =>
+      createInstaller({ spawnProcess })(
+        "/stage",
+        COMMIT,
+        1_000,
+        controller.signal,
+      ),
+    ).toThrow();
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
 });

@@ -49,6 +49,17 @@ describe("options", () => {
     );
   });
 
+  it("resolves relative overrides from the V2 plugin location", () => {
+    expect(
+      resolveOptions({ stateDir: "fixture-state" }, {}, "/project/checkout")
+        .stateDir,
+    ).toBe(resolve("/project/checkout/fixture-state"));
+    expect(
+      resolveOptions({ stateDir: "/shared/state" }, {}, "/project/checkout")
+        .stateDir,
+    ).toBe(resolve("/shared/state"));
+  });
+
   it.each([
     [{ updateMode: "sometimes" }, "updateMode"],
     [{ stateDir: "" }, "stateDir"],

@@ -1,14 +1,8 @@
-import {
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import type { Hooks } from "@opencode-ai/plugin";
+import type { Skill } from "@opencode/plugin";
 import lockfile from "proper-lockfile";
+import { loadSkills } from "./skills.js";
 import type { ResolvedOptions } from "./options.js";
 import {
   COMMIT_SHA_PATTERN,
@@ -41,11 +35,10 @@ interface OwnedLock {
   assertOwned: () => void;
 }
 
-interface SkillsConfig {
-  skills?: {
-    paths?: string[];
-    urls?: string[];
-  };
+export interface ActiveRelease {
+  state: StoredState;
+  path: string;
+  skills: readonly Skill.Info[];
 }
 
 function errorMessage(error: unknown): string {
@@ -100,6 +93,7 @@ export class SkillsManager {
   constructor(
     private readonly options: ResolvedOptions,
     private readonly runtime: Runtime,
+    private readonly signal: AbortSignal = new AbortController().signal,
   ) {
     this.stateFile = join(options.stateDir, "state.json");
     this.lockTarget = join(options.stateDir, "update");
@@ -107,37 +101,32 @@ export class SkillsManager {
     this.temporaryDir = join(options.stateDir, "tmp");
   }
 
-  async configure(config: SkillsConfig): Promise<void> {
+  async load(): Promise<ActiveRelease | undefined> {
+    this.signal.throwIfAborted();
     let active = await this.readValidActive();
     if (!active) {
       active = await this.installInitial();
-      if (!active) return;
-      this.injectPath(config, active.path);
-      return;
+      return active;
     }
 
     if (this.options.updateMode === "off" || !this.isStale(active.state)) {
-      this.injectPath(config, active.path);
-      return;
+      return active;
     }
 
     if (this.options.updateMode === "background") {
-      this.injectPath(config, active.path);
-      void this.maintain().catch((error: unknown) =>
-        this.warn("background update failed", error),
-      );
-      return;
+      return active;
     }
 
     await this.maintainSafely();
     const updated = await this.readValidActive();
-    this.injectPath(config, updated?.path ?? active.path);
+    return updated ?? active;
   }
 
-  private injectPath(config: SkillsConfig, path: string): void {
-    config.skills ??= {};
-    config.skills.paths ??= [];
-    if (!config.skills.paths.includes(path)) config.skills.paths.push(path);
+  async refresh(): Promise<ActiveRelease | undefined> {
+    this.signal.throwIfAborted();
+    if (!(await this.readValidActive())) return this.installInitial();
+    if (this.options.updateMode !== "off") await this.maintainSafely();
+    return this.readValidActive();
   }
 
   private isStale(state: StoredState): boolean {
@@ -147,15 +136,14 @@ export class SkillsManager {
     );
   }
 
-  private async installInitial(): Promise<
-    { state: StoredState; path: string } | undefined
-  > {
+  private async installInitial(): Promise<ActiveRelease | undefined> {
     const waitUntil =
       this.runtime.now() +
       this.options.checkTimeoutMs +
       this.options.installTimeoutMs;
 
     while (true) {
+      this.signal.throwIfAborted();
       const existing = await this.readValidActive();
       if (existing) return existing;
 
@@ -171,6 +159,7 @@ export class SkillsManager {
           await this.installRelease(remote, lock.assertOwned);
           return await this.readValidActive();
         } catch (error) {
+          this.signal.throwIfAborted();
           this.warn("initial install failed", error);
           return undefined;
         } finally {
@@ -186,6 +175,7 @@ export class SkillsManager {
       }
       await this.runtime.sleep(
         Math.min(LOCK_POLL_MS, Math.max(0, waitUntil - this.runtime.now())),
+        this.signal,
       );
     }
   }
@@ -194,11 +184,13 @@ export class SkillsManager {
     try {
       await this.maintain();
     } catch (error) {
+      this.signal.throwIfAborted();
       this.warn("update failed; keeping previous release", error);
     }
   }
 
   private async maintain(): Promise<void> {
+    this.signal.throwIfAborted();
     const lock = await this.acquireLock();
     if (!lock) return;
     try {
@@ -242,7 +234,7 @@ export class SkillsManager {
     try {
       const response = await this.runtime.fetch(COMMIT_URL, {
         headers,
-        signal: controller.signal,
+        signal: AbortSignal.any([controller.signal, this.signal]),
       });
       const responseEtag = response.headers.get("etag") ?? undefined;
       if (response.status === 304) {
@@ -290,12 +282,13 @@ export class SkillsManager {
         staging,
         remote.sha,
         this.options.installTimeoutMs,
+        this.signal,
       );
+      this.signal.throwIfAborted();
       assertLockOwned();
       const skillsPath = join(staging, ".agents", "skills");
-      if (!(await this.hasSkillFile(skillsPath))) {
-        throw new Error("skills CLI output contains no SKILL.md");
-      }
+      await loadSkills(skillsPath, this.signal);
+      this.signal.throwIfAborted();
       assertLockOwned();
       await mkdir(this.releasesDir, { recursive: true });
       await rename(staging, release);
@@ -316,27 +309,7 @@ export class SkillsManager {
     }
   }
 
-  private async hasSkillFile(directory: string): Promise<boolean> {
-    let entries;
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch {
-      return false;
-    }
-    for (const entry of entries) {
-      if (entry.isFile() && entry.name === "SKILL.md") return true;
-      if (
-        entry.isDirectory() &&
-        (await this.hasSkillFile(join(directory, entry.name)))
-      )
-        return true;
-    }
-    return false;
-  }
-
-  private async readValidActive(): Promise<
-    { state: StoredState; path: string } | undefined
-  > {
+  private async readValidActive(): Promise<ActiveRelease | undefined> {
     let state: StoredState | undefined;
     try {
       state = parseState(JSON.parse(await readFile(this.stateFile, "utf8")));
@@ -350,17 +323,22 @@ export class SkillsManager {
       ".agents",
       "skills",
     );
-    if (!(await this.hasSkillFile(path))) return undefined;
-    return { state, path };
+    try {
+      return { state, path, skills: await loadSkills(path, this.signal) };
+    } catch {
+      return undefined;
+    }
   }
 
   private async writeState(state: StoredState): Promise<void> {
+    this.signal.throwIfAborted();
     await mkdir(this.options.stateDir, { recursive: true });
     const temporary = `${this.stateFile}.${this.runtime.randomId()}.tmp`;
     try {
       await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, {
         flag: "wx",
       });
+      this.signal.throwIfAborted();
       await rename(temporary, this.stateFile);
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined);
@@ -408,12 +386,4 @@ export class SkillsManager {
   private warn(context: string, error: unknown): void {
     this.runtime.warn(`${context}: ${errorMessage(error)}`);
   }
-}
-
-export function createHooks(options: ResolvedOptions, runtime: Runtime): Hooks {
-  const manager = new SkillsManager(options, runtime);
-  return {
-    config: async (config) =>
-      manager.configure(config as unknown as SkillsConfig),
-  };
 }

@@ -1,11 +1,17 @@
-import type { Plugin, PluginOptions } from "@opencode-ai/plugin";
-import { createHooks } from "./manager.js";
-import { resolveOptions, type MattPocockSkillsOptions } from "./options.js";
+import { Plugin } from "@opencode/plugin";
+import { setupSkills } from "./plugin.js";
+import { resolveOptions } from "./options.js";
 import { createRuntime } from "./runtime.js";
 
 export type { MattPocockSkillsOptions, UpdateMode } from "./options.js";
 
-const plugin = (async (_input, options?: PluginOptions) =>
-  createHooks(resolveOptions(options), createRuntime())) satisfies Plugin;
-
-export default plugin;
+export default Plugin.define({
+  id: "opencode-matt-pocock-skills",
+  setup(ctx) {
+    return setupSkills(
+      ctx.skill,
+      resolveOptions(ctx.options, process.env, ctx.location.directory),
+      createRuntime(),
+    );
+  },
+});
